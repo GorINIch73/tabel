@@ -20,6 +20,7 @@ public:
     void close();
     bool is_open() const { return db_ != nullptr; }
     const std::string& path() const { return path_; }
+    bool save_as(const std::string& path, std::string& error) const;
 
     std::vector<Person> persons() const;
     std::vector<Position> positions() const;
@@ -57,7 +58,7 @@ public:
 
 private:
     bool exec(const std::string& sql, std::string& error) const;
-    bool migrate(std::string& error);
+    bool initialize_schema(std::string& error);
     bool seed_defaults(std::string& error);
 
     sqlite3* db_ = nullptr;

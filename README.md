@@ -12,6 +12,16 @@ cmake --build build -j 4
 
 При первой конфигурации CMake скачивает Dear ImGui docking branch и ImGuiFileDialog через `FetchContent`.
 
+## Установка в Linux
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 4
+sudo cmake --install build --prefix /usr
+```
+
+Установка кладет бинарник в `/usr/bin`, ресурсы в `/usr/share/tabel0504421`, desktop-файл в `/usr/share/applications` и иконку в `/usr/share/icons/hicolor/scalable/apps`.
+
 ## Реализованный стартовый срез
 
 - открытие и создание SQLite-баз через ImGuiFileDialog;

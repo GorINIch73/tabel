@@ -1,6 +1,9 @@
+#define IMGUI_DEFINE_MATH_OPERATORS
+
 #include "app.hpp"
 
 #include "calendar.hpp"
+#include "fonts.hpp"
 #include "widgets.hpp"
 
 #include <ImGuiFileDialog.h>
@@ -147,6 +150,23 @@ std::string shell_quote(const std::string& value) {
     return out;
 }
 
+std::string current_month_key() {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    if (std::tm* tm = std::localtime(&now)) local = *tm;
+    std::ostringstream out;
+    out << std::setw(4) << std::setfill('0') << (local.tm_year + 1900)
+        << '-' << std::setw(2) << std::setfill('0') << (local.tm_mon + 1);
+    return out.str();
+}
+
+std::filesystem::path monthly_backup_path(const std::string& database_path, const std::string& month_key) {
+    const std::filesystem::path source = std::filesystem::absolute(database_path);
+    const std::filesystem::path backup_dir = source.parent_path() / "backups";
+    const std::string extension = source.extension().empty() ? ".sqlite3" : source.extension().string();
+    return backup_dir / (source.stem().string() + "_backup_" + month_key + extension);
+}
+
 bool add_zip_text(zip_t* archive, const char* name, const std::string& text, bool store, std::string& error) {
     void* buffer = std::malloc(text.size());
     if (!buffer && !text.empty()) {
@@ -175,6 +195,11 @@ bool add_zip_text(zip_t* archive, const char* name, const std::string& text, boo
 std::filesystem::path ots_template_path() {
     const std::filesystem::path relative = std::filesystem::path("assets") / "0504421.ots";
     if (std::filesystem::exists(relative)) return relative;
+
+#ifdef TABEL0504421_DATA_DIR
+    const std::filesystem::path installed = std::filesystem::path(TABEL0504421_DATA_DIR) / "assets" / "0504421.ots";
+    if (std::filesystem::exists(installed)) return installed;
+#endif
 
     std::error_code ec;
     const std::filesystem::path executable = std::filesystem::read_symlink("/proc/self/exe", ec);
@@ -342,6 +367,211 @@ bool confirm_delete_button(const char* id, const char* target) {
     return confirmed;
 }
 
+struct CurrentMonthState {
+    int year = 0;
+    int month = 0;
+    int documents = 0;
+    bool accepted = false;
+    bool needs_refill = false;
+    int expected_cells = 0;
+    int existing_cells = 0;
+};
+
+CurrentMonthState current_month_state(
+    const Database& db,
+    const std::vector<TimesheetDocument>& documents,
+    const std::vector<Employee>& employees
+) {
+    CurrentMonthState state;
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    if (std::tm* tm = std::localtime(&now)) local = *tm;
+    state.year = local.tm_year + 1900;
+    state.month = local.tm_mon + 1;
+
+    for (const auto& document : documents) {
+        if (document.year != state.year || document.month != state.month) continue;
+        ++state.documents;
+        state.accepted = state.accepted || document.accepted;
+        state.needs_refill = state.needs_refill || document.needs_refill;
+    }
+
+    auto days = db.calendar_days(state.year, state.month);
+    if (days.empty()) days = build_local_calendar(state.year, state.month);
+    for (const auto& employee : employees) {
+        if (!employee.active) continue;
+        for (const auto& day : days) {
+            if (!works_on_date(employee, day.date)) continue;
+            ++state.expected_cells;
+            if (db.timesheet_cell(employee.id, day.date).has_value()) {
+                ++state.existing_cells;
+            }
+        }
+    }
+    return state;
+}
+
+void dashboard_metric(const char* label, const std::string& value, const std::string& hint, ImVec4 accent, ImVec4 bg) {
+    ImGui::TableNextColumn();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(accent.x, accent.y, accent.z, 0.55f));
+    ImGui::BeginChild(label, ImVec2(0.0f, 104.0f), ImGuiChildFlags_Border);
+    const ImVec2 window_pos = ImGui::GetWindowPos();
+    const ImVec2 window_size = ImGui::GetWindowSize();
+    ImGui::GetWindowDrawList()->AddRectFilled(window_pos, ImVec2(window_pos.x + 5.0f, window_pos.y + window_size.y),
+        ImGui::ColorConvertFloat4ToU32(accent), 2.0f);
+    ImGui::Indent(12.0f);
+    ImGui::TextDisabled("%s", label);
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(accent.x, accent.y, accent.z, 1.0f));
+    ImGui::SetWindowFontScale(1.35f);
+    ImGui::TextUnformatted(value.c_str());
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopStyleColor();
+    if (!hint.empty()) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("%s", hint.c_str());
+    }
+    ImGui::Unindent(12.0f);
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+}
+
+void shifted_month(int year, int month, int delta, int& out_year, int& out_month) {
+    out_year = year;
+    out_month = month + delta;
+    while (out_month < 1) {
+        out_month += 12;
+        --out_year;
+    }
+    while (out_month > 12) {
+        out_month -= 12;
+        ++out_year;
+    }
+}
+
+void dashboard_month_calendar(
+    int year,
+    int month,
+    const std::vector<CalendarDay>& calendar_days,
+    bool prominent
+) {
+    static constexpr const char* weekdays[] = {"Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"};
+    std::vector<CalendarDay> days = calendar_days.empty() ? build_local_calendar(year, month) : calendar_days;
+
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    if (std::tm* tm = std::localtime(&now)) local = *tm;
+    const std::string today = iso_date(local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
+
+    ImGui::PushID(year * 100 + month);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, prominent ? ImVec4(0.11f, 0.56f, 0.70f, 0.10f) : ImVec4(0.12f, 0.14f, 0.15f, 0.18f));
+    ImGui::PushStyleColor(ImGuiCol_Border, prominent ? ImVec4(0.11f, 0.56f, 0.70f, 0.58f) : ImVec4(0.36f, 0.42f, 0.46f, 0.38f));
+    ImGui::BeginChild("dashboard_month_calendar", ImVec2(288.0f, 286.0f), ImGuiChildFlags_Border);
+
+    ImGui::Text("%s %d", month_name(month), year);
+    ImGui::Separator();
+
+    ImGui::TextDisabled("Рабочие дни");
+    ImGui::SameLine();
+    ImGui::ColorButton("##workday_color", ImVec4(0.20f, 0.34f, 0.38f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(14.0f, 14.0f));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Вых.");
+    ImGui::SameLine();
+    ImGui::ColorButton("##weekend_color", ImVec4(0.34f, 0.40f, 0.50f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(14.0f, 14.0f));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Пр.");
+    ImGui::SameLine();
+    ImGui::ColorButton("##holiday_color", ImVec4(0.58f, 0.18f, 0.18f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(14.0f, 14.0f));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Сокр.");
+    ImGui::SameLine();
+    ImGui::ColorButton("##shortened_color", ImVec4(0.76f, 0.52f, 0.12f, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(14.0f, 14.0f));
+
+    ImGui::Spacing();
+    const float cell_size = 28.0f;
+    if (ImGui::BeginTable("dashboard_month_days", 7, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoHostExtendX)) {
+        for (int column = 0; column < 7; ++column) {
+            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cell_size);
+        }
+        for (const char* weekday : weekdays) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", weekday);
+        }
+
+        const int offset = first_weekday_monday0(year, month);
+        const int count = days_in_month(year, month);
+        const int rows = (offset + count + 6) / 7;
+        for (int cell = 0; cell < rows * 7; ++cell) {
+            ImGui::TableNextColumn();
+            if (cell < offset || cell >= offset + count) {
+                ImGui::Dummy(ImVec2(cell_size, cell_size));
+                continue;
+            }
+
+            const int day_number = cell - offset + 1;
+            const std::string date = iso_date(year, month, day_number);
+            const auto it = std::find_if(days.begin(), days.end(), [&date](const CalendarDay& day) { return day.date == date; });
+            const CalendarDay* day = it == days.end() ? nullptr : &*it;
+
+            ImVec4 color = ImVec4(0.20f, 0.34f, 0.38f, 0.94f);
+            if (day && day->weekend) {
+                color = ImVec4(0.34f, 0.40f, 0.50f, 0.94f);
+            }
+            if (day && day->holiday) {
+                color = ImVec4(0.58f, 0.18f, 0.18f, 0.94f);
+            }
+            if (day && day->shortened) {
+                color = ImVec4(0.76f, 0.52f, 0.12f, 0.94f);
+            }
+            if (!prominent) {
+                color.w *= 0.44f;
+            }
+
+            ImGui::PushID(day_number);
+            ImGui::Dummy(ImVec2(cell_size, cell_size));
+            const ImVec2 min = ImGui::GetItemRectMin();
+            const ImVec2 max = ImGui::GetItemRectMax();
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+            draw_list->AddRectFilled(min, max, ImGui::ColorConvertFloat4ToU32(color), 4.0f);
+            const std::string day_label = std::to_string(day_number);
+            const ImVec2 text_size = ImGui::CalcTextSize(day_label.c_str());
+            draw_list->AddText(ImVec2(min.x + (cell_size - text_size.x) * 0.5f, min.y + (cell_size - text_size.y) * 0.5f),
+                ImGui::ColorConvertFloat4ToU32(prominent ? ImVec4(1.0f, 1.0f, 1.0f, 0.96f) : ImVec4(1.0f, 1.0f, 1.0f, 0.48f)), day_label.c_str());
+            if (date == today) {
+                ImGui::GetWindowDrawList()->AddRect(min, max, ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, 0.95f)), 3.0f, 0, 2.0f);
+            }
+            if (day && ImGui::BeginItemTooltip()) {
+                ImGui::Text("%s", date.c_str());
+                if (day->holiday) ImGui::TextUnformatted("Праздник");
+                else if (day->weekend) ImGui::TextUnformatted("Выходной");
+                else ImGui::TextUnformatted("Рабочий день");
+                if (day->shortened) ImGui::TextUnformatted("Сокращенный день");
+                if (!day->comment.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextWrapped("%s", day->comment.c_str());
+                }
+                ImGui::EndTooltip();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+    ImGui::PopID();
+}
+
+void warning_banner(const char* icon, const char* title, const char* detail) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.95f, 0.72f, 0.12f, 0.16f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.95f, 0.72f, 0.12f, 0.46f));
+    ImGui::BeginChild(title, ImVec2(0.0f, 0.0f), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    ImGui::Text("%s %s", icon, title);
+    ImGui::TextWrapped("%s", detail);
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+}
+
 }
 
 App::App() {
@@ -349,6 +579,7 @@ App::App() {
     context_.year = settings_.last_year;
     context_.month = settings_.last_month;
     apply_theme();
+    apply_font_size();
     if (!settings_.last_database.empty() && std::filesystem::exists(settings_.last_database)) {
         open_database(settings_.last_database);
     }
@@ -362,6 +593,24 @@ App::~App() {
 
 void App::apply_theme() {
     ImGuiStyle& style = ImGui::GetStyle();
+    switch (settings_.theme) {
+        case 1:
+            ImGui::StyleColorsLight();
+            break;
+        case 2:
+            ImGui::StyleColorsClassic();
+            break;
+        case 3:
+            ImGui::StyleColorsLight();
+            break;
+        case 5:
+            ImGui::StyleColorsLight();
+            break;
+        default:
+            ImGui::StyleColorsDark();
+            break;
+    }
+
     style.WindowRounding = 6.0f;
     style.ChildRounding = 6.0f;
     style.FrameRounding = 5.0f;
@@ -373,11 +622,8 @@ void App::apply_theme() {
     style.FramePadding = ImVec2(9.0f, 6.0f);
     style.ItemSpacing = ImVec2(8.0f, 7.0f);
 
-    if (settings_.theme == 1) {
-        ImGui::StyleColorsLight();
-    } else {
-        ImGui::StyleColorsDark();
-        auto& c = style.Colors;
+    auto& c = style.Colors;
+    if (settings_.theme == 0) {
         c[ImGuiCol_WindowBg] = ImVec4(0.10f, 0.11f, 0.12f, 1.0f);
         c[ImGuiCol_Header] = ImVec4(0.20f, 0.34f, 0.38f, 1.0f);
         c[ImGuiCol_HeaderHovered] = ImVec4(0.24f, 0.43f, 0.48f, 1.0f);
@@ -385,7 +631,70 @@ void App::apply_theme() {
         c[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.45f, 0.49f, 1.0f);
         c[ImGuiCol_ButtonActive] = ImVec4(0.14f, 0.52f, 0.47f, 1.0f);
         c[ImGuiCol_TabActive] = ImVec4(0.18f, 0.35f, 0.38f, 1.0f);
+    } else if (settings_.theme == 2) {
+        c[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.15f, 0.15f, 1.0f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.28f, 0.24f, 0.20f, 1.0f);
+        c[ImGuiCol_Header] = ImVec4(0.36f, 0.29f, 0.22f, 0.78f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.45f, 0.36f, 0.26f, 0.86f);
+        c[ImGuiCol_Button] = ImVec4(0.34f, 0.29f, 0.24f, 0.82f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.46f, 0.36f, 0.27f, 0.92f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.55f, 0.39f, 0.24f, 1.0f);
+        c[ImGuiCol_TabActive] = ImVec4(0.34f, 0.29f, 0.24f, 1.0f);
+    } else if (settings_.theme == 3) {
+        c[ImGuiCol_WindowBg] = ImVec4(0.96f, 0.97f, 0.97f, 1.0f);
+        c[ImGuiCol_Text] = ImVec4(0.08f, 0.09f, 0.10f, 1.0f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.11f, 0.32f, 0.46f, 1.0f);
+        c[ImGuiCol_Header] = ImVec4(0.20f, 0.45f, 0.58f, 0.52f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.20f, 0.45f, 0.58f, 0.72f);
+        c[ImGuiCol_Button] = ImVec4(0.16f, 0.39f, 0.52f, 0.82f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.13f, 0.48f, 0.64f, 0.92f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.10f, 0.56f, 0.70f, 1.0f);
+        c[ImGuiCol_TabActive] = ImVec4(0.17f, 0.43f, 0.56f, 1.0f);
+    } else if (settings_.theme == 4) {
+        c[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.09f, 0.10f, 1.0f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.18f, 0.21f, 0.24f, 1.0f);
+        c[ImGuiCol_Header] = ImVec4(0.28f, 0.34f, 0.40f, 0.82f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.36f, 0.44f, 0.52f, 0.92f);
+        c[ImGuiCol_Button] = ImVec4(0.24f, 0.29f, 0.34f, 0.92f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.34f, 0.41f, 0.48f, 1.0f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.46f, 0.57f, 0.66f, 1.0f);
+        c[ImGuiCol_TabActive] = ImVec4(0.24f, 0.31f, 0.37f, 1.0f);
+    } else if (settings_.theme == 5) {
+        c[ImGuiCol_WindowBg] = ImVec4(0.95f, 0.97f, 0.94f, 1.0f);
+        c[ImGuiCol_Text] = ImVec4(0.08f, 0.12f, 0.09f, 1.0f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.18f, 0.38f, 0.24f, 1.0f);
+        c[ImGuiCol_Header] = ImVec4(0.26f, 0.52f, 0.34f, 0.48f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.26f, 0.52f, 0.34f, 0.68f);
+        c[ImGuiCol_Button] = ImVec4(0.20f, 0.42f, 0.27f, 0.82f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.22f, 0.52f, 0.32f, 0.92f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.18f, 0.62f, 0.35f, 1.0f);
+        c[ImGuiCol_TabActive] = ImVec4(0.25f, 0.48f, 0.32f, 1.0f);
+    } else if (settings_.theme == 6) {
+        c[ImGuiCol_WindowBg] = ImVec4(0.12f, 0.08f, 0.09f, 1.0f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.38f, 0.12f, 0.16f, 1.0f);
+        c[ImGuiCol_Header] = ImVec4(0.46f, 0.16f, 0.22f, 0.82f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.56f, 0.20f, 0.28f, 0.92f);
+        c[ImGuiCol_Button] = ImVec4(0.38f, 0.14f, 0.20f, 0.92f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.52f, 0.18f, 0.26f, 1.0f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.68f, 0.22f, 0.32f, 1.0f);
+        c[ImGuiCol_TabActive] = ImVec4(0.42f, 0.15f, 0.22f, 1.0f);
+    } else if (settings_.theme == 7) {
+        c[ImGuiCol_WindowBg] = ImVec4(0.00f, 0.00f, 0.00f, 1.0f);
+        c[ImGuiCol_Text] = ImVec4(1.00f, 1.00f, 1.00f, 1.0f);
+        c[ImGuiCol_TextDisabled] = ImVec4(0.78f, 0.78f, 0.78f, 1.0f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.00f, 0.25f, 0.42f, 1.0f);
+        c[ImGuiCol_Header] = ImVec4(0.00f, 0.36f, 0.58f, 1.0f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.00f, 0.50f, 0.78f, 1.0f);
+        c[ImGuiCol_Button] = ImVec4(0.00f, 0.32f, 0.54f, 1.0f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.00f, 0.48f, 0.78f, 1.0f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.00f, 0.66f, 0.96f, 1.0f);
+        c[ImGuiCol_TabActive] = ImVec4(0.00f, 0.40f, 0.64f, 1.0f);
     }
+}
+
+void App::apply_font_size() {
+    ImGuiIO& io = ImGui::GetIO();
+    use_project_font_size(io, settings_.font_size);
 }
 
 void App::open_database(const std::string& path) {
@@ -401,11 +710,102 @@ void App::open_database(const std::string& path) {
     if (settings_.recent_databases.size() > 10) settings_.recent_databases.resize(10);
     save_settings(settings_);
     refresh();
+    std::string backup_error;
+    const bool backup_ok = auto_backup_database(backup_error);
     status_ = "Открыта база: " + path;
+    last_error_ = backup_ok ? "" : backup_error;
 }
 
 void App::create_database(const std::string& path) {
     open_database(path);
+}
+
+bool App::auto_backup_database(std::string& error) {
+    if (!db_.is_open() || db_.path().empty()) return true;
+    if (!settings_.auto_backup_enabled) return true;
+
+    const std::string month_key = current_month_key();
+    const std::string database_key = std::filesystem::absolute(db_.path()).lexically_normal().string();
+    if (settings_.last_backup_database == database_key && settings_.last_backup_month == month_key) {
+        return true;
+    }
+
+    const std::filesystem::path backup = monthly_backup_path(db_.path(), month_key);
+    std::error_code ec;
+    std::filesystem::create_directories(backup.parent_path(), ec);
+    if (ec) {
+        error = "Автобэкап не создан: " + ec.message();
+        return false;
+    }
+
+    if (!std::filesystem::exists(backup, ec)) {
+        std::string backup_error;
+        if (!db_.save_as(backup.string(), backup_error)) {
+            error = "Автобэкап не создан: " + backup_error;
+            return false;
+        }
+    }
+
+    settings_.last_backup_database = database_key;
+    settings_.last_backup_month = month_key;
+    save_settings(settings_);
+    return true;
+}
+
+bool App::save_pending_changes(std::string& error) {
+    if (!db_.is_open()) {
+        error = "База не открыта";
+        return false;
+    }
+    ImGui::ClearActiveID();
+
+    if (edited_person_id_ > 0 && !db_.save_person(edited_person_, error)) return false;
+    if (edited_position_id_ > 0 && !db_.save_position(edited_position_, error)) return false;
+    if (edited_employee_id_ > 0 && !db_.save_employee(edited_employee_, error)) return false;
+    if (edited_activity_id_ > 0 && !db_.save_activity(edited_activity_, error)) return false;
+    if (edited_period_id_ > 0) {
+        if (!db_.save_activity_period(edited_period_, error)) return false;
+    }
+    if (edited_norm_id_ > 0 && !db_.save_norm(edited_norm_, error)) return false;
+    if (edited_timesheet_document_id_ > 0 && !db_.save_timesheet_document(edited_timesheet_document_, error)) return false;
+    if (!db_.save_institution(edited_institution_, error)) return false;
+
+    return true;
+}
+
+void App::save_database_as(const std::string& path) {
+    if (path.empty()) return;
+    std::string error;
+    if (!save_pending_changes(error)) {
+        autosave_status(false, error);
+        return;
+    }
+
+    const std::filesystem::path target = path;
+    const std::filesystem::path current = db_.path();
+    std::error_code compare_ec;
+    if (std::filesystem::exists(target, compare_ec) && std::filesystem::equivalent(target, current, compare_ec)) {
+        refresh();
+        status_ = "Изменения сохранены";
+        last_error_.clear();
+        return;
+    }
+    if (!target.parent_path().empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) {
+            autosave_status(false, "Не удалось создать каталог: " + ec.message());
+            return;
+        }
+    }
+
+    if (!db_.save_as(path, error)) {
+        autosave_status(false, error);
+        return;
+    }
+    open_database(path);
+    status_ = "База сохранена как: " + path;
+    last_error_.clear();
 }
 
 void App::refresh() {
@@ -980,24 +1380,6 @@ void App::render() {
 void App::render_menu() {
     if (!ImGui::BeginMainMenuBar()) return;
     if (ImGui::BeginMenu(" Файл")) {
-        if (ImGui::MenuItem(" Открыть")) {
-            IGFD::FileDialogConfig config;
-            config.path = ".";
-            IGFD::FileDialog::Instance()->OpenDialog("OpenDb", "Открыть базу", ".db,.sqlite,.sqlite3", config);
-        }
-        if (ImGui::MenuItem(" Создать")) {
-            IGFD::FileDialogConfig config;
-            config.path = ".";
-            config.fileName = "tabel.sqlite3";
-            IGFD::FileDialog::Instance()->OpenDialog("CreateDb", "Создать базу", ".db,.sqlite,.sqlite3", config);
-        }
-        if (ImGui::BeginMenu(" Недавние базы", !settings_.recent_databases.empty())) {
-            for (const auto& recent : settings_.recent_databases) {
-                if (ImGui::MenuItem(recent.c_str())) open_database(recent);
-            }
-            ImGui::EndMenu();
-        }
-        ImGui::Separator();
         if (ImGui::MenuItem(" Выход")) should_close_ = true;
         ImGui::EndMenu();
     }
@@ -1016,6 +1398,37 @@ void App::render_menu() {
         ImGui::MenuItem(" Должности", nullptr, &show_positions_);
         ImGui::MenuItem(" Нормы времени", nullptr, &show_norms_);
         ImGui::MenuItem(" Учреждение", nullptr, &show_institution_);
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu(" База")) {
+        if (ImGui::MenuItem(" Открыть")) {
+            IGFD::FileDialogConfig config;
+            config.path = ".";
+            IGFD::FileDialog::Instance()->OpenDialog("OpenDb", "Открыть базу", ".db,.sqlite,.sqlite3", config);
+        }
+        if (ImGui::MenuItem(" Создать")) {
+            IGFD::FileDialogConfig config;
+            config.path = ".";
+            config.fileName = "tabel.sqlite3";
+            IGFD::FileDialog::Instance()->OpenDialog("CreateDb", "Создать базу", ".db,.sqlite,.sqlite3", config);
+        }
+        if (ImGui::MenuItem(" Сохранить базу как...", nullptr, false, db_.is_open())) {
+            std::string error;
+            if (save_pending_changes(error)) {
+                IGFD::FileDialogConfig config;
+                config.path = db_.path().empty() ? "." : std::filesystem::path(db_.path()).parent_path().string();
+                config.fileName = db_.path().empty() ? "tabel.sqlite3" : std::filesystem::path(db_.path()).filename().string();
+                IGFD::FileDialog::Instance()->OpenDialog("SaveDbAs", "Сохранить базу как", ".db,.sqlite,.sqlite3", config);
+            } else {
+                autosave_status(false, error);
+            }
+        }
+        if (ImGui::BeginMenu(" Недавние базы", !settings_.recent_databases.empty())) {
+            for (const auto& recent : settings_.recent_databases) {
+                if (ImGui::MenuItem(recent.c_str())) open_database(recent);
+            }
+            ImGui::EndMenu();
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu(" Прочее")) {
@@ -1113,50 +1526,223 @@ void App::render_dashboard() {
         return;
     }
 
+    auto shift_dashboard_month = [this](int delta) {
+        int month = context_.month + delta;
+        while (month < 1) {
+            month += 12;
+            --context_.year;
+        }
+        while (month > 12) {
+            month -= 12;
+            ++context_.year;
+        }
+        context_.month = month;
+        selected_calendar_date_ = iso_date(context_.year, context_.month, 1);
+        refresh();
+    };
+
+    if (ImGui::ArrowButton("dashboard_prev_month", ImGuiDir_Left)) {
+        shift_dashboard_month(-1);
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150.0f);
+    if (ImGui::BeginCombo("##dashboard_month", month_name(context_.month))) {
+        for (int month = 1; month <= 12; ++month) {
+            const bool selected = context_.month == month;
+            if (ImGui::Selectable(month_name(month), selected)) {
+                context_.month = month;
+                selected_calendar_date_ = iso_date(context_.year, context_.month, 1);
+                refresh();
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(92.0f);
+    int dashboard_year = context_.year;
+    if (ImGui::InputInt("##dashboard_year", &dashboard_year, 0, 0, ImGuiInputTextFlags_CharsDecimal) && dashboard_year > 1900) {
+        context_.year = dashboard_year;
+        selected_calendar_date_ = iso_date(context_.year, context_.month, 1);
+        refresh();
+    }
+    ImGui::SameLine();
+    if (ImGui::ArrowButton("dashboard_next_month", ImGuiDir_Right)) {
+        shift_dashboard_month(1);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Сегодня##dashboard_month")) {
+        std::time_t now = std::time(nullptr);
+        if (std::tm* tm = std::localtime(&now)) {
+            context_.year = tm->tm_year + 1900;
+            context_.month = tm->tm_mon + 1;
+            selected_calendar_date_ = iso_date(context_.year, context_.month, tm->tm_mday);
+            refresh();
+        }
+    }
+    ImGui::Spacing();
+
     int active_employees = 0;
     for (const auto& e : employees_) {
         if (e.active) ++active_employees;
     }
+    const int inactive_employees = static_cast<int>(employees_.size()) - active_employees;
+    const int accepted_documents = static_cast<int>(std::count_if(timesheet_documents_.begin(), timesheet_documents_.end(), [](const TimesheetDocument& d) {
+        return d.accepted;
+    }));
+    std::vector<TimesheetDocument> refill_documents;
+    for (const auto& document : timesheet_documents_) {
+        if (document.needs_refill && !document.accepted) refill_documents.push_back(document);
+    }
+    int context_documents = 0;
+    for (const auto& document : timesheet_documents_) {
+        if (document.year == context_.year && document.month == context_.month) ++context_documents;
+    }
+    const CurrentMonthState current = current_month_state(db_, timesheet_documents_, employees_);
+    const int missing_current_cells = std::max(0, current.expected_cells - current.existing_cells);
 
     if (ImGui::BeginTable("dashboard_summary", 4, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::TextDisabled("Физлица");
-        ImGui::Text("%d", static_cast<int>(persons_.size()));
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextDisabled("Сотрудники");
-        ImGui::Text("%d / %d активных", active_employees, static_cast<int>(employees_.size()));
-        ImGui::TableSetColumnIndex(2);
-        ImGui::TextDisabled("Документы месяца");
-        ImGui::Text("%d", static_cast<int>(periods_.size()));
-        ImGui::TableSetColumnIndex(3);
-        ImGui::TextDisabled("Период");
-        ImGui::Text("%s %d", month_name(context_.month), context_.year);
+        dashboard_metric("Текущий период", std::string(month_name(context_.month)) + " " + std::to_string(context_.year),
+            std::to_string(context_documents) + " таб.",
+            ImVec4(0.11f, 0.56f, 0.70f, 1.0f), ImVec4(0.11f, 0.56f, 0.70f, 0.11f));
+        dashboard_metric("Сотрудники", std::to_string(active_employees) + " активных",
+            inactive_employees > 0 ? (std::to_string(inactive_employees) + " неактивных").c_str() : "",
+            ImVec4(0.24f, 0.62f, 0.31f, 1.0f), ImVec4(0.24f, 0.62f, 0.31f, 0.11f));
+        dashboard_metric("Табели", std::to_string(timesheet_documents_.size()) + " всего",
+            std::to_string(accepted_documents) + " принятых",
+            ImVec4(0.76f, 0.45f, 0.12f, 1.0f), ImVec4(0.76f, 0.45f, 0.12f, 0.12f));
+        dashboard_metric("Активности", std::to_string(periods_.size()) + " в месяце",
+            std::to_string(upcoming_periods_.size()) + " ближайших",
+            ImVec4(0.56f, 0.37f, 0.72f, 1.0f), ImVec4(0.56f, 0.37f, 0.72f, 0.12f));
         ImGui::EndTable();
     }
 
     ImGui::Spacing();
-    if (ImGui::Button(" Активности сотрудников")) show_periods_ = true;
-    ImGui::SameLine();
-    if (ImGui::Button(" Список табелей")) show_timesheets_ = true;
-    ImGui::SameLine();
-    if (ImGui::Button(" Сотрудники")) show_employees_ = true;
-    ImGui::SameLine();
-    if (ImGui::Button(" Виды активности")) show_activities_ = true;
-    ImGui::SameLine();
-    if (ImGui::Button(" Создать/перезаполнить текущий месяц")) {
+    ImGui::SeparatorText("Календарь");
+    int prev_year = 0;
+    int prev_month = 0;
+    int next_year = 0;
+    int next_month = 0;
+    shifted_month(context_.year, context_.month, -1, prev_year, prev_month);
+    shifted_month(context_.year, context_.month, 1, next_year, next_month);
+    auto prev_days = db_.calendar_days(prev_year, prev_month);
+    if (prev_days.empty()) prev_days = build_local_calendar(prev_year, prev_month);
+    auto next_days = db_.calendar_days(next_year, next_month);
+    if (next_days.empty()) next_days = build_local_calendar(next_year, next_month);
+    if (ImGui::BeginTable("dashboard_three_months", 3, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        dashboard_month_calendar(prev_year, prev_month, prev_days, false);
+        ImGui::TableNextColumn();
+        dashboard_month_calendar(context_.year, context_.month, month_days_, true);
+        ImGui::TableNextColumn();
+        dashboard_month_calendar(next_year, next_month, next_days, false);
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    if (current.documents == 0) {
+        warning_banner("", "Табель текущего месяца еще не создан",
+            (std::string("Нет табеля за ") + month_name(current.month) + " " + std::to_string(current.year) + ". Создайте и заполните его перед закрытием месяца.").c_str());
+    } else if (missing_current_cells > 0 && !current.accepted) {
+        warning_banner("", "Табель текущего месяца заполнен не полностью",
+            (std::to_string(missing_current_cells) + " ячеек из " + std::to_string(current.expected_cells) + " еще не заполнены. Перезаполнение создаст значения по календарю, нормам и периодам активности.").c_str());
+    } else if (current.needs_refill && !current.accepted) {
+        warning_banner("", "Табель текущего месяца требует перезаполнения",
+            "После изменений в периодах активности данные текущего табеля могут быть устаревшими.");
+    }
+    if (!refill_documents.empty()) {
+        ImGui::Spacing();
+        warning_banner("", "Есть табели, требующие перезаполнения",
+            (std::to_string(refill_documents.size()) + " таб. помечены как устаревшие после изменений в периодах активности.").c_str());
+    }
+
+    ImGui::Spacing();
+    if (current.documents == 0 && ImGui::Button(" Заполнить текущий месяц")) {
         TimesheetDocument document;
-        document.year = context_.year;
-        document.month = context_.month;
-        document.title = "Табель";
+        document.year = current.year;
+        document.month = current.month;
+        if (document.title.empty()) document.title = "Табель";
         std::string error;
         if (db_.create_or_refill_timesheet_document(document, error)) {
+            edited_timesheet_document_id_ = document.id;
+            edited_timesheet_document_ = document;
+            context_.year = document.year;
+            context_.month = document.month;
             refresh();
-            status_ = "Табель создан и заполнен по текущим данным";
+            show_timesheets_ = true;
+            status_ = "Табель текущего месяца заполнен";
             last_error_.clear();
         } else {
             autosave_status(false, error);
         }
+    }
+    if (current.documents == 0) ImGui::SameLine();
+    if (!refill_documents.empty()) {
+        const std::string refill_button = " Табели к обновлению (" + std::to_string(refill_documents.size()) + ")";
+        if (ImGui::Button(refill_button.c_str())) {
+            show_timesheets_ = true;
+            edited_timesheet_document_ = refill_documents.front();
+            edited_timesheet_document_id_ = edited_timesheet_document_.id;
+            context_.year = edited_timesheet_document_.year;
+            context_.month = edited_timesheet_document_.month;
+            refresh();
+        }
+        ImGui::SameLine();
+    }
+    if (ImGui::Button(" Активности сотрудников")) show_periods_ = true;
+    ImGui::SameLine();
+    if (ImGui::Button(" Все табели")) show_timesheets_ = true;
+    ImGui::SameLine();
+    if (ImGui::Button(" Сотрудники")) show_employees_ = true;
+
+    ImGui::SeparatorText("Табели");
+    if (timesheet_documents_.empty()) {
+        ImGui::TextDisabled("Табелей пока нет.");
+    } else if (ImGui::BeginTable("dashboard_timesheets", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Период", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableSetupColumn("Документ");
+        ImGui::TableSetupColumn("Статус", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Создан", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableSetupColumn("Действие", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableHeadersRow();
+        int shown = 0;
+        for (const auto& document : timesheet_documents_) {
+            if (shown >= 7) break;
+            ++shown;
+            ImGui::TableNextRow();
+            if (document.needs_refill && !document.accepted) {
+                const ImU32 refill_bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.95f, 0.72f, 0.12f, 0.24f));
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, refill_bg);
+            }
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%s %d", month_name(document.month), document.year);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(document.title.c_str());
+            ImGui::TableSetColumnIndex(2);
+            if (document.accepted) {
+                ImGui::TextUnformatted("Принят");
+            } else if (document.needs_refill) {
+                ImGui::TextUnformatted("Обновить");
+            } else {
+                ImGui::TextUnformatted("В работе");
+            }
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(document.created_at.c_str());
+            ImGui::TableSetColumnIndex(4);
+            ImGui::PushID(document.id);
+            if (ImGui::SmallButton("Открыть")) {
+                edited_timesheet_document_ = document;
+                edited_timesheet_document_id_ = document.id;
+                context_.year = document.year;
+                context_.month = document.month;
+                show_timesheets_ = true;
+                refresh();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
     }
 
     ImGui::SeparatorText("Ближайшие отсутствия и отклонения");
@@ -1261,12 +1847,13 @@ void App::render_timesheets() {
     ImGui::BeginChild("timesheets_list", ImVec2(0, timesheets_list_height_), ImGuiChildFlags_Border);
     bool select_timesheet_document = false;
     TimesheetDocument selected_timesheet_document;
-    if (ImGui::BeginTable("timesheets_documents_table", 6,
+    if (ImGui::BeginTable("timesheets_documents_table", 7,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 64.0f);
         ImGui::TableSetupColumn("Год", ImGuiTableColumnFlags_WidthFixed, 78.0f);
         ImGui::TableSetupColumn("Месяц", ImGuiTableColumnFlags_WidthFixed, 120.0f);
         ImGui::TableSetupColumn("Наименование");
+        ImGui::TableSetupColumn("Создан", ImGuiTableColumnFlags_WidthFixed, 150.0f);
         ImGui::TableSetupColumn("Обновить", ImGuiTableColumnFlags_WidthFixed, 90.0f);
         ImGui::TableSetupColumn("Принят", ImGuiTableColumnFlags_WidthFixed, 76.0f);
         ImGui::TableHeadersRow();
@@ -1294,8 +1881,10 @@ void App::render_timesheets() {
             ImGui::TableSetColumnIndex(3);
             ImGui::TextUnformatted(d.title.c_str());
             ImGui::TableSetColumnIndex(4);
-            ImGui::TextUnformatted(d.needs_refill ? "!" : "");
+            ImGui::TextUnformatted(d.created_at.c_str());
             ImGui::TableSetColumnIndex(5);
+            ImGui::TextUnformatted(d.needs_refill ? "!" : "");
+            ImGui::TableSetColumnIndex(6);
             ImGui::TextUnformatted(d.accepted ? "Да" : "");
         }
         ImGui::EndTable();
@@ -1416,6 +2005,7 @@ void App::render_timesheets() {
     }
     input_text("Название", edited_timesheet_document_.title); save |= ImGui::IsItemDeactivatedAfterEdit();
     input_text("Примечание", edited_timesheet_document_.note); save |= ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::TextDisabled("Создан: %s", edited_timesheet_document_.created_at.empty() ? "-" : edited_timesheet_document_.created_at.c_str());
 
     if (save && edited_timesheet_document_.year > 0) {
         std::string error;
@@ -1892,7 +2482,8 @@ void App::render_periods_tab() {
     ImGui::TextDisabled("Показаны все периоды из базы. Для табеля учитываются периоды, пересекающие выбранный месяц.");
     ImGui::Separator();
     for (auto& p : all_periods_) {
-        const std::string row = p.date_from + " - " + p.date_to + "  " + p.employee_name + "  " + p.activity_code;
+        const std::string row = p.date_from + " - " + p.date_to + "  " + p.employee_name + "  " + p.activity_code +
+            "  |  создан: " + (p.created_at.empty() ? "-" : p.created_at);
         if (ImGui::Selectable(row.c_str(), edited_period_id_ == p.id)) {
             edited_period_ = p;
             edited_period_id_ = p.id;
@@ -1945,6 +2536,7 @@ void App::render_periods_tab() {
     save |= input_date("Дата по", edited_period_.date_to);
     ImGui::InputDouble("Часов в день", &edited_period_.hours, 0.1, 1.0, "%.2f"); save |= ImGui::IsItemDeactivatedAfterEdit();
     input_multiline_wrapped("Основание / примечание", edited_period_.note, 110.0f); save |= ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::TextDisabled("Создан: %s", edited_period_.created_at.empty() ? "-" : edited_period_.created_at.c_str());
     const std::string period_delete_title = edited_period_.date_from + " - " + edited_period_.date_to;
     if (confirm_delete_button("period", period_delete_title.c_str())) {
         std::string error;
@@ -2277,16 +2869,56 @@ void App::render_settings() {
         ImGui::End();
         return;
     }
-    int theme = settings_.theme;
-    ImGui::RadioButton("Темная", &theme, 0);
-    ImGui::SameLine();
-    ImGui::RadioButton("Светлая", &theme, 1);
-    if (theme != settings_.theme) {
-        settings_.theme = theme;
+    static constexpr const char* theme_names[] = {
+        "Темная",
+        "Светлая",
+        "Классическая",
+        "Светлая синяя",
+        "Графит",
+        "Лес",
+        "Бордовая",
+        "Высокий контраст"
+    };
+    static constexpr int theme_count = static_cast<int>(std::size(theme_names));
+    int selected_theme = std::clamp(settings_.theme, 0, theme_count - 1);
+    ImGui::TextUnformatted("Тема");
+    if (ImGui::BeginCombo("##theme", theme_names[selected_theme])) {
+        for (int i = 0; i < theme_count; ++i) {
+            const bool selected = selected_theme == i;
+            if (ImGui::Selectable(theme_names[i], selected)) {
+                selected_theme = i;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (selected_theme != settings_.theme) {
+        settings_.theme = selected_theme;
         apply_theme();
         save_settings(settings_);
     }
-    ImGui::Checkbox("Показать ImGui demo", &show_demo_);
+
+    float selected_font_size = settings_.font_size;
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Размер шрифта");
+    bool first_font_size = true;
+    for (float size : font_size_options()) {
+        if (!first_font_size) ImGui::SameLine();
+        first_font_size = false;
+        const std::string label = std::to_string(static_cast<int>(size));
+        if (ImGui::RadioButton(label.c_str(), std::abs(selected_font_size - size) < 0.1f)) {
+            selected_font_size = size;
+        }
+    }
+    if (std::abs(selected_font_size - settings_.font_size) >= 0.1f) {
+        settings_.font_size = selected_font_size;
+        apply_font_size();
+        save_settings(settings_);
+    }
+    ImGui::Spacing();
+    if (ImGui::Checkbox("Автоматический бэкап базы раз в месяц", &settings_.auto_backup_enabled)) {
+        save_settings(settings_);
+    }
     ImGui::Text("Файл настроек: %s", settings_path().c_str());
     ImGui::End();
 }
@@ -2311,6 +2943,10 @@ void App::render_file_dialogs() {
     }
     if (IGFD::FileDialog::Instance()->Display("CreateDb", ImGuiWindowFlags_NoCollapse, min_size, max_size)) {
         if (IGFD::FileDialog::Instance()->IsOk()) create_database(IGFD::FileDialog::Instance()->GetFilePathName());
+        IGFD::FileDialog::Instance()->Close();
+    }
+    if (IGFD::FileDialog::Instance()->Display("SaveDbAs", ImGuiWindowFlags_NoCollapse, min_size, max_size)) {
+        if (IGFD::FileDialog::Instance()->IsOk()) save_database_as(IGFD::FileDialog::Instance()->GetFilePathName());
         IGFD::FileDialog::Instance()->Close();
     }
 }

@@ -70,7 +70,7 @@ bool Database::open(const std::string& path, std::string& error) {
     path_ = path;
     exec("PRAGMA foreign_keys = ON;", error);
     exec("PRAGMA journal_mode = WAL;", error);
-    if (!migrate(error) || !seed_defaults(error)) {
+    if (!initialize_schema(error) || !seed_defaults(error)) {
         close();
         return false;
     }
@@ -83,6 +83,38 @@ void Database::close() {
     path_.clear();
 }
 
+bool Database::save_as(const std::string& path, std::string& error) const {
+    if (!db_) {
+        error = "База не открыта";
+        return false;
+    }
+    sqlite3* target = nullptr;
+    if (sqlite3_open(path.c_str(), &target) != SQLITE_OK) {
+        error = target ? sqlite3_errmsg(target) : "Не удалось создать файл базы";
+        if (target) sqlite3_close(target);
+        return false;
+    }
+
+    sqlite3_backup* backup = sqlite3_backup_init(target, "main", db_, "main");
+    if (!backup) {
+        error = sqlite3_errmsg(target);
+        sqlite3_close(target);
+        return false;
+    }
+    const int step = sqlite3_backup_step(backup, -1);
+    const int finish = sqlite3_backup_finish(backup);
+    if (step != SQLITE_DONE || finish != SQLITE_OK) {
+        error = sqlite3_errmsg(target);
+        sqlite3_close(target);
+        return false;
+    }
+    if (sqlite3_close(target) != SQLITE_OK) {
+        error = "Не удалось закрыть сохраненную базу";
+        return false;
+    }
+    return true;
+}
+
 bool Database::exec(const std::string& sql, std::string& error) const {
     char* raw_error = nullptr;
     if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &raw_error) != SQLITE_OK) {
@@ -93,7 +125,7 @@ bool Database::exec(const std::string& sql, std::string& error) const {
     return true;
 }
 
-bool Database::migrate(std::string& error) {
+bool Database::initialize_schema(std::string& error) {
     static constexpr const char* schema = R"sql(
 CREATE TABLE IF NOT EXISTS institution (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -150,7 +182,8 @@ CREATE TABLE IF NOT EXISTS activity_periods (
     date_from TEXT NOT NULL,
     date_to TEXT NOT NULL,
     hours REAL NOT NULL DEFAULT 0.0,
-    note TEXT NOT NULL DEFAULT ''
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS work_norms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,27 +222,9 @@ CREATE TABLE IF NOT EXISTS timesheet_cells (
     PRIMARY KEY (employee_id, date)
 );
 INSERT OR IGNORE INTO institution (id, title) VALUES (1, '');
+PRAGMA user_version = 1;
 )sql";
-    if (!exec(schema, error)) return false;
-    std::string alter_error;
-    if (!exec("ALTER TABLE institution ADD COLUMN executor_position TEXT NOT NULL DEFAULT '';", alter_error) &&
-        alter_error.find("duplicate column name") == std::string::npos) {
-        error = alter_error;
-        return false;
-    }
-    alter_error.clear();
-    if (!exec("ALTER TABLE institution ADD COLUMN executor_position_code TEXT NOT NULL DEFAULT '';", alter_error) &&
-        alter_error.find("duplicate column name") == std::string::npos) {
-        error = alter_error;
-        return false;
-    }
-    alter_error.clear();
-    if (!exec("ALTER TABLE institution ADD COLUMN structural_unit TEXT NOT NULL DEFAULT '';", alter_error) &&
-        alter_error.find("duplicate column name") == std::string::npos) {
-        error = alter_error;
-        return false;
-    }
-    return true;
+    return exec(schema, error);
 }
 
 bool Database::seed_defaults(std::string& error) {
@@ -229,9 +244,6 @@ bool Database::seed_defaults(std::string& error) {
     for (const char* sql : rows) {
         if (!exec(sql, error)) return false;
     }
-    exec("UPDATE activity_kinds SET default_hours = 8.0 WHERE code = 'Я' AND (default_hours = 0.0 OR default_hours = 8.2);", error);
-    exec("UPDATE work_norms SET hours_per_day = 8.0 WHERE id = 1 AND title = 'Полная ставка' AND hours_per_day = 8.2 AND short_friday = 0;", error);
-    exec("UPDATE work_norms SET hours_per_day = 4.0 WHERE id = 2 AND title = 'Половина ставки' AND hours_per_day = 4.1 AND short_friday = 0;", error);
     return true;
 }
 
@@ -314,7 +326,7 @@ std::vector<ActivityPeriod> Database::activity_periods(int year, int month) cons
     const std::string from = iso_date(year, month, 1);
     const std::string to = iso_date(year, month, days_in_month(year, month));
     Statement st;
-    sqlite3_prepare_v2(db_, "SELECT ap.id, ap.employee_id, ap.activity_id, COALESCE(NULLIF(p.full_name, ''), e.full_name), ak.title, ak.code, ap.date_from, ap.date_to, ap.hours, ap.note FROM activity_periods ap JOIN employees e ON e.id = ap.employee_id LEFT JOIN persons p ON p.id = e.person_id JOIN activity_kinds ak ON ak.id = ap.activity_id WHERE ap.date_from <= ? AND ap.date_to >= ? ORDER BY ap.date_from, ap.id;", -1, &st.stmt, nullptr);
+    sqlite3_prepare_v2(db_, "SELECT ap.id, ap.employee_id, ap.activity_id, COALESCE(NULLIF(p.full_name, ''), e.full_name), ak.title, ak.code, ap.date_from, ap.date_to, ap.hours, ap.note, ap.created_at FROM activity_periods ap JOIN employees e ON e.id = ap.employee_id LEFT JOIN persons p ON p.id = e.person_id JOIN activity_kinds ak ON ak.id = ap.activity_id WHERE ap.date_from <= ? AND ap.date_to >= ? ORDER BY ap.date_from, ap.id;", -1, &st.stmt, nullptr);
     bind_text(st.stmt, 1, to);
     bind_text(st.stmt, 2, from);
     while (sqlite3_step(st.stmt) == SQLITE_ROW) {
@@ -329,6 +341,7 @@ std::vector<ActivityPeriod> Database::activity_periods(int year, int month) cons
         p.date_to = text_column(st.stmt, 7);
         p.hours = sqlite3_column_double(st.stmt, 8);
         p.note = text_column(st.stmt, 9);
+        p.created_at = text_column(st.stmt, 10);
         out.push_back(p);
     }
     return out;
@@ -337,7 +350,7 @@ std::vector<ActivityPeriod> Database::activity_periods(int year, int month) cons
 std::vector<ActivityPeriod> Database::all_activity_periods() const {
     std::vector<ActivityPeriod> out;
     Statement st;
-    sqlite3_prepare_v2(db_, "SELECT ap.id, ap.employee_id, ap.activity_id, COALESCE(NULLIF(p.full_name, ''), e.full_name), ak.title, ak.code, ap.date_from, ap.date_to, ap.hours, ap.note FROM activity_periods ap JOIN employees e ON e.id = ap.employee_id LEFT JOIN persons p ON p.id = e.person_id JOIN activity_kinds ak ON ak.id = ap.activity_id ORDER BY ap.date_from DESC, ap.date_to DESC, ap.id DESC;", -1, &st.stmt, nullptr);
+    sqlite3_prepare_v2(db_, "SELECT ap.id, ap.employee_id, ap.activity_id, COALESCE(NULLIF(p.full_name, ''), e.full_name), ak.title, ak.code, ap.date_from, ap.date_to, ap.hours, ap.note, ap.created_at FROM activity_periods ap JOIN employees e ON e.id = ap.employee_id LEFT JOIN persons p ON p.id = e.person_id JOIN activity_kinds ak ON ak.id = ap.activity_id ORDER BY ap.date_from DESC, ap.date_to DESC, ap.id DESC;", -1, &st.stmt, nullptr);
     while (sqlite3_step(st.stmt) == SQLITE_ROW) {
         ActivityPeriod p;
         p.id = sqlite3_column_int(st.stmt, 0);
@@ -350,6 +363,7 @@ std::vector<ActivityPeriod> Database::all_activity_periods() const {
         p.date_to = text_column(st.stmt, 7);
         p.hours = sqlite3_column_double(st.stmt, 8);
         p.note = text_column(st.stmt, 9);
+        p.created_at = text_column(st.stmt, 10);
         out.push_back(p);
     }
     return out;
@@ -358,7 +372,7 @@ std::vector<ActivityPeriod> Database::all_activity_periods() const {
 std::vector<ActivityPeriod> Database::upcoming_activity_periods(int limit) const {
     std::vector<ActivityPeriod> out;
     Statement st;
-    sqlite3_prepare_v2(db_, "SELECT ap.id, ap.employee_id, ap.activity_id, COALESCE(NULLIF(p.full_name, ''), e.full_name), ak.title, ak.code, ap.date_from, ap.date_to, ap.hours, ap.note FROM activity_periods ap JOIN employees e ON e.id = ap.employee_id LEFT JOIN persons p ON p.id = e.person_id JOIN activity_kinds ak ON ak.id = ap.activity_id WHERE ap.date_to >= date('now', 'localtime') ORDER BY CASE WHEN ap.date_from < date('now', 'localtime') THEN date('now', 'localtime') ELSE ap.date_from END, ap.date_to, ap.id LIMIT ?;", -1, &st.stmt, nullptr);
+    sqlite3_prepare_v2(db_, "SELECT ap.id, ap.employee_id, ap.activity_id, COALESCE(NULLIF(p.full_name, ''), e.full_name), ak.title, ak.code, ap.date_from, ap.date_to, ap.hours, ap.note, ap.created_at FROM activity_periods ap JOIN employees e ON e.id = ap.employee_id LEFT JOIN persons p ON p.id = e.person_id JOIN activity_kinds ak ON ak.id = ap.activity_id WHERE ap.date_to >= date('now', 'localtime') ORDER BY CASE WHEN ap.date_from < date('now', 'localtime') THEN date('now', 'localtime') ELSE ap.date_from END, ap.date_to, ap.id LIMIT ?;", -1, &st.stmt, nullptr);
     sqlite3_bind_int(st.stmt, 1, limit);
     while (sqlite3_step(st.stmt) == SQLITE_ROW) {
         ActivityPeriod p;
@@ -372,6 +386,7 @@ std::vector<ActivityPeriod> Database::upcoming_activity_periods(int limit) const
         p.date_to = text_column(st.stmt, 7);
         p.hours = sqlite3_column_double(st.stmt, 8);
         p.note = text_column(st.stmt, 9);
+        p.created_at = text_column(st.stmt, 10);
         out.push_back(p);
     }
     return out;
@@ -547,8 +562,8 @@ bool Database::save_activity_period(ActivityPeriod& p, std::string& error) {
     if (p.date_to < p.date_from) std::swap(p.date_from, p.date_to);
     Statement st;
     const char* sql = p.id == 0
-        ? "INSERT INTO activity_periods (employee_id, activity_id, date_from, date_to, hours, note) VALUES (?, ?, ?, ?, ?, ?);"
-        : "UPDATE activity_periods SET employee_id=?, activity_id=?, date_from=?, date_to=?, hours=?, note=? WHERE id=?;";
+        ? "INSERT INTO activity_periods (employee_id, activity_id, date_from, date_to, hours, note, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now', 'localtime')) RETURNING id, created_at;"
+        : "UPDATE activity_periods SET employee_id=?, activity_id=?, date_from=?, date_to=?, hours=?, note=? WHERE id=? RETURNING id, created_at;";
     if (sqlite3_prepare_v2(db_, sql, -1, &st.stmt, nullptr) != SQLITE_OK) { error = sqlite3_errmsg(db_); return false; }
     sqlite3_bind_int(st.stmt, 1, p.employee_id);
     sqlite3_bind_int(st.stmt, 2, p.activity_id);
@@ -557,8 +572,9 @@ bool Database::save_activity_period(ActivityPeriod& p, std::string& error) {
     sqlite3_bind_double(st.stmt, 5, p.hours);
     bind_text(st.stmt, 6, p.note);
     if (p.id != 0) sqlite3_bind_int(st.stmt, 7, p.id);
-    if (sqlite3_step(st.stmt) != SQLITE_DONE) { error = sqlite3_errmsg(db_); return false; }
-    if (p.id == 0) p.id = static_cast<int>(sqlite3_last_insert_rowid(db_));
+    if (sqlite3_step(st.stmt) != SQLITE_ROW) { error = sqlite3_errmsg(db_); return false; }
+    p.id = sqlite3_column_int(st.stmt, 0);
+    p.created_at = text_column(st.stmt, 1);
     return true;
 }
 

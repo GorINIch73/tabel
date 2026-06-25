@@ -16,8 +16,12 @@ public:
 
 private:
     void apply_theme();
+    void apply_font_size();
     void open_database(const std::string& path);
     void create_database(const std::string& path);
+    bool auto_backup_database(std::string& error);
+    bool save_pending_changes(std::string& error);
+    void save_database_as(const std::string& path);
     void refresh();
     void autosave_status(bool ok, const std::string& error);
     void load_calendar_year(int year);

@@ -106,6 +106,7 @@ struct ActivityPeriod {
     std::string date_to;
     double hours = 0.0;
     std::string note;
+    std::string created_at;
 };
 
 struct MonthContext {

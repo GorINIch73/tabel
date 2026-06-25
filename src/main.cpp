@@ -1,4 +1,6 @@
 #include "app.hpp"
+#include "fonts.hpp"
+#include "settings.hpp"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -7,56 +9,14 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
-#include <filesystem>
-#include <string>
 
 namespace {
 void glfw_error_callback(int error, const char* description) {
     std::fprintf(stderr, "GLFW error %d: %s\n", error, description);
 }
-
-void merge_icon_font_if_exists(ImGuiIO& io, const char* path) {
-    if (!std::filesystem::exists(path)) return;
-    static const ImWchar icon_ranges[] = {
-        0xf000, 0xf2ff,
-        0
-    };
-    ImFontConfig icon_config;
-    icon_config.MergeMode = true;
-    icon_config.PixelSnapH = true;
-    icon_config.GlyphMinAdvanceX = 18.0f;
-    io.Fonts->AddFontFromFileTTF(path, 18.0f, &icon_config, icon_ranges);
 }
 
-std::filesystem::path font_path(const char* argv0, const char* filename) {
-    const std::filesystem::path relative = std::filesystem::path("assets") / "fonts" / filename;
-    if (std::filesystem::exists(relative)) return relative;
-    if (argv0 && *argv0) {
-        const std::filesystem::path executable_dir = std::filesystem::absolute(argv0).parent_path();
-        const std::filesystem::path near_executable = executable_dir / "assets" / "fonts" / filename;
-        if (std::filesystem::exists(near_executable)) return near_executable;
-        const std::filesystem::path project_relative = executable_dir / ".." / "assets" / "fonts" / filename;
-        if (std::filesystem::exists(project_relative)) return project_relative;
-    }
-    return relative;
-}
-
-void load_project_fonts(ImGuiIO& io, const char* argv0) {
-    ImFontConfig config;
-    config.OversampleH = 2;
-    config.OversampleV = 2;
-
-    const std::string text_font = font_path(argv0, "NotoSans-Regular.ttf").string();
-    if (std::filesystem::exists(text_font)) {
-        io.Fonts->AddFontFromFileTTF(text_font.c_str(), 18.0f, &config, io.Fonts->GetGlyphRangesCyrillic());
-    }
-
-    const std::string icons = font_path(argv0, "fontawesome-webfont.ttf").string();
-    merge_icon_font_if_exists(io, icons.c_str());
-}
-}
-
-int main(int argc, char** argv) {
+int main() {
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) return 1;
 
@@ -79,8 +39,8 @@ int main(int argc, char** argv) {
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = nullptr;
 
-    load_project_fonts(io, argc > 0 ? argv[0] : nullptr);
-    if (io.Fonts->Fonts.empty()) io.Fonts->AddFontDefault();
+    const UserSettings startup_settings = load_settings();
+    load_project_fonts(io, startup_settings.font_size);
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);

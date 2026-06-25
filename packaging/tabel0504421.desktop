@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Табель 0504421
+Comment=Учет рабочего времени и подготовка табеля 0504421
+Exec=tabel0504421
+Icon=tabel0504421
+Terminal=false
+Categories=Office;Finance;
+StartupNotify=true

@@ -14,6 +14,7 @@ pkg_check_modules(GLFW3 REQUIRED glfw3)
 pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 pkg_check_modules(LIBCURL REQUIRED libcurl)
 pkg_check_modules(FREETYPE REQUIRED freetype2)
+pkg_check_modules(LIBZIP REQUIRED libzip)
 find_package(OpenGL REQUIRED)
 
 FetchContent_Declare(
@@ -70,7 +71,15 @@ add_executable(tabel0504421
     src/widgets.cpp
 )
 
-target_include_directories(tabel0504421 PRIVATE src ${SQLITE3_INCLUDE_DIRS} ${LIBCURL_INCLUDE_DIRS})
-target_link_directories(tabel0504421 PRIVATE ${GLFW3_LIBRARY_DIRS} ${SQLITE3_LIBRARY_DIRS} ${LIBCURL_LIBRARY_DIRS})
-target_link_libraries(tabel0504421 PRIVATE imgui_backend ${SQLITE3_LIBRARIES} ${LIBCURL_LIBRARIES})
+target_include_directories(tabel0504421 PRIVATE src ${SQLITE3_INCLUDE_DIRS} ${LIBCURL_INCLUDE_DIRS} ${LIBZIP_INCLUDE_DIRS})
+target_link_directories(tabel0504421 PRIVATE ${GLFW3_LIBRARY_DIRS} ${SQLITE3_LIBRARY_DIRS} ${LIBCURL_LIBRARY_DIRS} ${LIBZIP_LIBRARY_DIRS})
+target_link_libraries(tabel0504421 PRIVATE imgui_backend ${SQLITE3_LIBRARIES} ${LIBCURL_LIBRARIES} ${LIBZIP_LIBRARIES})
 target_compile_options(tabel0504421 PRIVATE -Wall -Wextra -Wpedantic)
+
+add_custom_command(TARGET tabel0504421 POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -Dsrc=${CMAKE_SOURCE_DIR}/assets
+        -Ddst=$<TARGET_FILE_DIR:tabel0504421>/assets
+        -P ${CMAKE_SOURCE_DIR}/cmake/copy_runtime_assets.cmake
+    COMMENT "Copying runtime assets"
+)

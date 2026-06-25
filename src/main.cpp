@@ -32,8 +32,11 @@ std::filesystem::path font_path(const char* argv0, const char* filename) {
     const std::filesystem::path relative = std::filesystem::path("assets") / "fonts" / filename;
     if (std::filesystem::exists(relative)) return relative;
     if (argv0 && *argv0) {
-        const std::filesystem::path executable_relative = std::filesystem::absolute(argv0).parent_path() / ".." / "assets" / "fonts" / filename;
-        if (std::filesystem::exists(executable_relative)) return executable_relative;
+        const std::filesystem::path executable_dir = std::filesystem::absolute(argv0).parent_path();
+        const std::filesystem::path near_executable = executable_dir / "assets" / "fonts" / filename;
+        if (std::filesystem::exists(near_executable)) return near_executable;
+        const std::filesystem::path project_relative = executable_dir / ".." / "assets" / "fonts" / filename;
+        if (std::filesystem::exists(project_relative)) return project_relative;
     }
     return relative;
 }

@@ -60,7 +60,10 @@ struct Institution {
     std::string okpo;
     std::string inn;
     std::string address;
+    std::string structural_unit;
     std::string responsible;
+    std::string executor_position;
+    std::string executor_position_code;
 };
 
 struct CalendarDay {

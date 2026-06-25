@@ -1,0 +1,17 @@
+if(NOT DEFINED src OR NOT DEFINED dst)
+    message(FATAL_ERROR "copy_runtime_assets.cmake requires src and dst")
+endif()
+
+file(REMOVE_RECURSE "${dst}")
+file(MAKE_DIRECTORY "${dst}")
+file(GLOB_RECURSE runtime_assets LIST_DIRECTORIES false RELATIVE "${src}" "${src}/*")
+
+foreach(asset IN LISTS runtime_assets)
+    get_filename_component(name "${asset}" NAME)
+    if(name MATCHES "^\\.~lock\\." OR name MATCHES "~$" OR name MATCHES "\\.bak$")
+        continue()
+    endif()
+    get_filename_component(asset_dir "${asset}" DIRECTORY)
+    file(MAKE_DIRECTORY "${dst}/${asset_dir}")
+    file(COPY_FILE "${src}/${asset}" "${dst}/${asset}")
+endforeach()

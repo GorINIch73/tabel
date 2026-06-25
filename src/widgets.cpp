@@ -103,7 +103,7 @@ bool input_date(const char* label, std::string& value) {
     }
     ImGui::SameLine();
     static std::unordered_map<ImGuiID, DatePickerState> picker_states;
-    if (ImGui::Button("▦")) {
+    if (ImGui::Button("##open_date_picker")) {
         int open_year = 0;
         int open_month = 0;
         int open_day = 0;

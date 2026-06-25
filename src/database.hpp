@@ -26,6 +26,7 @@ public:
     std::vector<Employee> employees() const;
     std::vector<ActivityKind> activities() const;
     std::vector<ActivityPeriod> activity_periods(int year, int month) const;
+    std::vector<ActivityPeriod> all_activity_periods() const;
     std::vector<ActivityPeriod> upcoming_activity_periods(int limit) const;
     std::vector<WorkNorm> norms() const;
     Institution institution() const;

@@ -2,10 +2,12 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <ctime>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 
 namespace {
 size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -31,6 +33,40 @@ std::set<int> parse_days(const std::string& text) {
     }
     return days;
 }
+
+struct CalendarToken {
+    int day = 0;
+    char marker = '\0';
+};
+
+std::vector<CalendarToken> parse_calendar_tokens(const std::string& text) {
+    std::vector<CalendarToken> tokens;
+    std::regex token("(\\d+)([+*]?)");
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), token); it != std::sregex_iterator(); ++it) {
+        CalendarToken parsed;
+        parsed.day = std::stoi((*it)[1].str());
+        const std::string marker = (*it)[2].str();
+        parsed.marker = marker.empty() ? '\0' : marker.front();
+        tokens.push_back(parsed);
+    }
+    return tokens;
+}
+
+std::string transition_comment(const std::unordered_map<std::string, std::string>& transitions, const std::string& month_day) {
+    if (const auto it = transitions.find(month_day); it != transitions.end()) {
+        return "Перенос выходного дня: " + month_day + " -> " + it->second;
+    }
+    for (const auto& [from, to] : transitions) {
+        if (to == month_day) return "Рабочий день по переносу: " + from + " -> " + to;
+    }
+    return "";
+}
+
+std::string month_day_key(int month, int day) {
+    char buffer[8]{};
+    std::snprintf(buffer, sizeof(buffer), "%02d.%02d", month, day);
+    return buffer;
+}
 }
 
 int days_in_month(int year, int month) {
@@ -55,7 +91,7 @@ std::vector<CalendarDay> build_local_calendar(int year, int month) {
         d.date = iso_date(year, month, day);
         d.day = day;
         d.weekend = is_weekend(year, month, day);
-        d.holiday = d.weekend;
+        d.holiday = false;
         d.shortened = false;
         d.mark = d.weekend ? "В" : "Я";
         out.push_back(d);
@@ -90,6 +126,12 @@ bool download_ru_calendar(int year, std::vector<CalendarDay>& days, std::string&
     }
 
     days.clear();
+    std::unordered_map<std::string, std::string> transitions;
+    const std::regex transition_re(R"json(\{\s*"from"\s*:\s*"([0-9]{2}\.[0-9]{2})"\s*,\s*"to"\s*:\s*"([0-9]{2}\.[0-9]{2})"\s*\})json");
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), transition_re); it != std::sregex_iterator(); ++it) {
+        transitions[(*it)[1].str()] = (*it)[2].str();
+    }
+
     for (int month = 1; month <= 12; ++month) {
         auto month_days = build_local_calendar(year, month);
         const std::string pattern = "\\{[^\\{\\}]*\"month\"\\s*:\\s*" + std::to_string(month) + "[^\\{\\}]*\\}";
@@ -98,24 +140,61 @@ bool download_ru_calendar(int year, std::vector<CalendarDay>& days, std::string&
         if (std::regex_search(body, m, month_re)) {
             const std::string block = m.str();
             std::smatch h;
-            std::set<int> holidays;
-            std::set<int> preholidays;
-            if (std::regex_search(block, h, std::regex("\"holidays\"\\s*:\\s*\"([^\"]*)\""))) {
-                holidays = parse_days(h[1].str());
-            }
-            if (std::regex_search(block, h, std::regex("\"preholidays\"\\s*:\\s*\"([^\"]*)\""))) {
-                preholidays = parse_days(h[1].str());
-            }
-            for (auto& d : month_days) {
-                if (holidays.contains(d.day)) {
-                    d.weekend = true;
-                    d.holiday = true;
-                    d.mark = "В";
-                    d.comment = "Загружено из производственного календаря";
+            if (std::regex_search(block, h, std::regex("\"days\"\\s*:\\s*\"([^\"]*)\""))) {
+                for (const auto& token : parse_calendar_tokens(h[1].str())) {
+                    auto day_it = std::find_if(month_days.begin(), month_days.end(), [&token](const CalendarDay& day) {
+                        return day.day == token.day;
+                    });
+                    if (day_it == month_days.end()) continue;
+
+                    const std::string month_day = month_day_key(month, token.day);
+                    const bool natural_weekend = is_weekend(year, month, token.day);
+                    const std::string transfer = transition_comment(transitions, month_day);
+
+                    if (token.marker == '*') {
+                        day_it->weekend = false;
+                        day_it->holiday = false;
+                        day_it->shortened = true;
+                        day_it->mark = "Я";
+                        day_it->comment = transfer.empty() ? "Предпраздничный сокращенный день" : transfer + "; сокращенный день";
+                    } else if (token.marker == '+') {
+                        day_it->weekend = true;
+                        day_it->holiday = !natural_weekend;
+                        day_it->shortened = false;
+                        day_it->mark = "В";
+                        day_it->comment = transfer.empty() ? "Выходной по производственному календарю" : transfer;
+                    } else {
+                        day_it->weekend = true;
+                        day_it->holiday = !natural_weekend;
+                        day_it->shortened = false;
+                        day_it->mark = "В";
+                        day_it->comment = natural_weekend ? "" : "Праздничный нерабочий день";
+                    }
                 }
-                if (preholidays.contains(d.day)) {
-                    d.shortened = true;
-                    d.comment = "Предпраздничный сокращенный день";
+            } else {
+                std::set<int> holidays;
+                std::set<int> preholidays;
+                if (std::regex_search(block, h, std::regex("\"holidays\"\\s*:\\s*\"([^\"]*)\""))) {
+                    holidays = parse_days(h[1].str());
+                }
+                if (std::regex_search(block, h, std::regex("\"preholidays\"\\s*:\\s*\"([^\"]*)\""))) {
+                    preholidays = parse_days(h[1].str());
+                }
+                for (auto& d : month_days) {
+                    const bool natural_weekend = is_weekend(year, month, d.day);
+                    if (holidays.contains(d.day)) {
+                        d.weekend = true;
+                        d.holiday = !natural_weekend;
+                        d.mark = "В";
+                        d.comment = natural_weekend ? "" : "Праздничный нерабочий день";
+                    }
+                    if (preholidays.contains(d.day)) {
+                        d.weekend = false;
+                        d.holiday = false;
+                        d.shortened = true;
+                        d.mark = "Я";
+                        d.comment = "Предпраздничный сокращенный день";
+                    }
                 }
             }
         }
@@ -123,4 +202,3 @@ bool download_ru_calendar(int year, std::vector<CalendarDay>& days, std::string&
     }
     return true;
 }
-

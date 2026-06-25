@@ -36,10 +36,13 @@ bool is_friday(const std::string& date) {
     return t.tm_wday == 5;
 }
 
-double work_hours_for_day(const WorkNorm& norm, const std::string& date) {
+double work_hours_for_day(const WorkNorm& norm, const CalendarDay& day) {
     double hours = norm.hours_per_day;
     if (norm.short_friday) {
-        hours += is_friday(date) ? -0.8 : 0.2;
+        hours += is_friday(day.date) ? -0.8 : 0.2;
+    }
+    if (day.shortened) {
+        hours -= 1.0;
     }
     return std::max(0.0, hours);
 }
@@ -98,7 +101,10 @@ CREATE TABLE IF NOT EXISTS institution (
     okpo TEXT NOT NULL DEFAULT '',
     inn TEXT NOT NULL DEFAULT '',
     address TEXT NOT NULL DEFAULT '',
-    responsible TEXT NOT NULL DEFAULT ''
+    structural_unit TEXT NOT NULL DEFAULT '',
+    responsible TEXT NOT NULL DEFAULT '',
+    executor_position TEXT NOT NULL DEFAULT '',
+    executor_position_code TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS persons (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,6 +191,24 @@ CREATE TABLE IF NOT EXISTS timesheet_cells (
 INSERT OR IGNORE INTO institution (id, title) VALUES (1, '');
 )sql";
     if (!exec(schema, error)) return false;
+    std::string alter_error;
+    if (!exec("ALTER TABLE institution ADD COLUMN executor_position TEXT NOT NULL DEFAULT '';", alter_error) &&
+        alter_error.find("duplicate column name") == std::string::npos) {
+        error = alter_error;
+        return false;
+    }
+    alter_error.clear();
+    if (!exec("ALTER TABLE institution ADD COLUMN executor_position_code TEXT NOT NULL DEFAULT '';", alter_error) &&
+        alter_error.find("duplicate column name") == std::string::npos) {
+        error = alter_error;
+        return false;
+    }
+    alter_error.clear();
+    if (!exec("ALTER TABLE institution ADD COLUMN structural_unit TEXT NOT NULL DEFAULT '';", alter_error) &&
+        alter_error.find("duplicate column name") == std::string::npos) {
+        error = alter_error;
+        return false;
+    }
     return true;
 }
 
@@ -310,6 +334,27 @@ std::vector<ActivityPeriod> Database::activity_periods(int year, int month) cons
     return out;
 }
 
+std::vector<ActivityPeriod> Database::all_activity_periods() const {
+    std::vector<ActivityPeriod> out;
+    Statement st;
+    sqlite3_prepare_v2(db_, "SELECT ap.id, ap.employee_id, ap.activity_id, COALESCE(NULLIF(p.full_name, ''), e.full_name), ak.title, ak.code, ap.date_from, ap.date_to, ap.hours, ap.note FROM activity_periods ap JOIN employees e ON e.id = ap.employee_id LEFT JOIN persons p ON p.id = e.person_id JOIN activity_kinds ak ON ak.id = ap.activity_id ORDER BY ap.date_from DESC, ap.date_to DESC, ap.id DESC;", -1, &st.stmt, nullptr);
+    while (sqlite3_step(st.stmt) == SQLITE_ROW) {
+        ActivityPeriod p;
+        p.id = sqlite3_column_int(st.stmt, 0);
+        p.employee_id = sqlite3_column_int(st.stmt, 1);
+        p.activity_id = sqlite3_column_int(st.stmt, 2);
+        p.employee_name = text_column(st.stmt, 3);
+        p.activity_title = text_column(st.stmt, 4);
+        p.activity_code = text_column(st.stmt, 5);
+        p.date_from = text_column(st.stmt, 6);
+        p.date_to = text_column(st.stmt, 7);
+        p.hours = sqlite3_column_double(st.stmt, 8);
+        p.note = text_column(st.stmt, 9);
+        out.push_back(p);
+    }
+    return out;
+}
+
 std::vector<ActivityPeriod> Database::upcoming_activity_periods(int limit) const {
     std::vector<ActivityPeriod> out;
     Statement st;
@@ -353,13 +398,16 @@ std::vector<WorkNorm> Database::norms() const {
 Institution Database::institution() const {
     Institution i;
     Statement st;
-    sqlite3_prepare_v2(db_, "SELECT title, okpo, inn, address, responsible FROM institution WHERE id = 1;", -1, &st.stmt, nullptr);
+    sqlite3_prepare_v2(db_, "SELECT title, okpo, inn, address, structural_unit, responsible, executor_position, executor_position_code FROM institution WHERE id = 1;", -1, &st.stmt, nullptr);
     if (sqlite3_step(st.stmt) == SQLITE_ROW) {
         i.title = text_column(st.stmt, 0);
         i.okpo = text_column(st.stmt, 1);
         i.inn = text_column(st.stmt, 2);
         i.address = text_column(st.stmt, 3);
-        i.responsible = text_column(st.stmt, 4);
+        i.structural_unit = text_column(st.stmt, 4);
+        i.responsible = text_column(st.stmt, 5);
+        i.executor_position = text_column(st.stmt, 6);
+        i.executor_position_code = text_column(st.stmt, 7);
     }
     return i;
 }
@@ -581,12 +629,15 @@ bool Database::save_norm(WorkNorm& n, std::string& error) {
 
 bool Database::save_institution(const Institution& i, std::string& error) {
     Statement st;
-    sqlite3_prepare_v2(db_, "UPDATE institution SET title=?, okpo=?, inn=?, address=?, responsible=? WHERE id=1;", -1, &st.stmt, nullptr);
+    sqlite3_prepare_v2(db_, "UPDATE institution SET title=?, okpo=?, inn=?, address=?, structural_unit=?, responsible=?, executor_position=?, executor_position_code=? WHERE id=1;", -1, &st.stmt, nullptr);
     bind_text(st.stmt, 1, i.title);
     bind_text(st.stmt, 2, i.okpo);
     bind_text(st.stmt, 3, i.inn);
     bind_text(st.stmt, 4, i.address);
-    bind_text(st.stmt, 5, i.responsible);
+    bind_text(st.stmt, 5, i.structural_unit);
+    bind_text(st.stmt, 6, i.responsible);
+    bind_text(st.stmt, 7, i.executor_position);
+    bind_text(st.stmt, 8, i.executor_position_code);
     if (sqlite3_step(st.stmt) != SQLITE_DONE) { error = sqlite3_errmsg(db_); return false; }
     return true;
 }
@@ -792,7 +843,9 @@ bool Database::refill_timesheet(int year, int month, std::string& error) {
 
             double day_hours = 8.0;
             if (const auto it = norms_by_id.find(e.norm_id); it != norms_by_id.end()) {
-                day_hours = work_hours_for_day(it->second, d.date);
+                day_hours = work_hours_for_day(it->second, d);
+            } else if (d.shortened) {
+                day_hours = 7.0;
             }
             TimesheetCell cell;
             cell.employee_id = e.id;

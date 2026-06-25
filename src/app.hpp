@@ -20,6 +20,9 @@ private:
     void create_database(const std::string& path);
     void refresh();
     void autosave_status(bool ok, const std::string& error);
+    void load_calendar_year(int year);
+    bool print_timesheet_html(const TimesheetDocument& document, std::string& output_path, std::string& error);
+    bool export_timesheet_ods(const TimesheetDocument& document, std::string& output_path, std::string& error);
 
     void render_menu();
     void render_dockspace();
@@ -54,10 +57,12 @@ private:
     std::vector<Employee> employees_;
     std::vector<ActivityKind> activities_;
     std::vector<ActivityPeriod> periods_;
+    std::vector<ActivityPeriod> all_periods_;
     std::vector<ActivityPeriod> upcoming_periods_;
     std::vector<WorkNorm> norms_;
     std::vector<TimesheetDocument> timesheet_documents_;
     std::vector<CalendarDay> month_days_;
+    std::vector<CalendarDay> calendar_year_days_;
 
     Person edited_person_;
     Position edited_position_;
@@ -76,7 +81,9 @@ private:
     int edited_period_id_ = 0;
     int edited_norm_id_ = 0;
     int edited_timesheet_document_id_ = 0;
+    int calendar_year_loaded_ = 0;
     std::string employee_filter_;
+    std::string selected_calendar_date_;
     std::string status_ = "База не открыта";
     std::string last_error_;
     bool dock_layout_built_ = false;
